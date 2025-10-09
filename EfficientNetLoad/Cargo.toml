@@ -1,0 +1,14 @@
+[package]
+name = "efficientnet_autism"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+image = "0.25"
+ort = "2.0.0-rc.10"
+ndarray = "0.15"
+
+[profile.release]
+opt-level = 3
