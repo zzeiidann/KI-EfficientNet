@@ -1,0 +1,11 @@
+[package]
+name = "EfficientNetTrain"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tch = { version = "0.14", features = ["download-libtorch"] }
+anyhow = "1.0"
+rand = "0.8"
+image = "0.24"
+rayon = "1.7"
