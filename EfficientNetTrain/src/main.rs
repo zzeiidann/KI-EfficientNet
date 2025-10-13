@@ -6,10 +6,11 @@ use tch::{nn, nn::ModuleT, nn::OptimizerConfig, Device, Kind, Tensor};
 use tch::IndexOp;
 use image::{imageops, DynamicImage};
 use rayon::prelude::*;
+use indicatif::{ProgressBar, ProgressStyle};
 
-const IMG_SIZE: u32 = 224;   // Untuk B5 “asli” gunakan 456
+const IMG_SIZE: u32 = 224;   // B5 asli biasanya 456
 const EPOCHS: i64 = 10;
-const BATCH_SIZE: usize = 16;  // Turunkan jika OOM
+const BATCH_SIZE: usize = 32;  // Sesuaikan RAM
 const LEARNING_RATE: f64 = 0.001;
 
 fn normalize_tensor(mut tensor: Tensor) -> Tensor {
@@ -55,14 +56,27 @@ fn load_split_dataset(
         return Ok((all_images, all_labels, classes));
     }
 
-    println!("\n📂 Loading {} dataset...", split.to_uppercase());
-    let class_entries: Vec<_> = fs::read_dir(&split_path)?.filter_map(|e| e.ok()).collect();
+    println!("\n Loading {} dataset...", split.to_uppercase());
 
-    for (idx, entry) in class_entries.iter().enumerate() {
-        let class_name = entry.file_name().into_string().unwrap_or_else(|_| format!("class_{}", idx));
+    // Ambil semua entri, tapi hanya proses yang direktori agar aman dari file nyasar
+    let entries: Vec<_> = fs::read_dir(&split_path)?
+        .filter_map(|e| e.ok())
+        .collect();
+
+    for (idx, entry) in entries.iter().enumerate() {
+        let class_dir = entry.path();
+        if !class_dir.is_dir() {
+            eprintln!("  ⚠ Skip non-directory in {}: {:?}", split, class_dir.file_name());
+            continue;
+        }
+
+        let class_name = class_dir.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
         classes.push(class_name.clone());
 
-        let img_paths: Vec<_> = fs::read_dir(entry.path())?
+        let img_paths: Vec<_> = fs::read_dir(&class_dir)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.is_file())
@@ -104,7 +118,7 @@ fn load_split_dataset(
 
 // ------ MODEL ------
 
-// Rust 2024: tambahkan `+ use<>` agar impl tidak “mengikat” lifetime &nn::Path ke 'static.
+// Rust 2024: gunakan `+ use<>` agar impl tidak mengikat lifetime &nn::Path ke 'static.
 fn mbconv_block(
     vs: &nn::Path,
     in_c: i64,
@@ -159,7 +173,7 @@ fn mbconv_block(
 }
 
 fn efficientnet_b5(vs: &nn::Path, num_classes: i64) -> impl nn::ModuleT + use<> {
-    // Konfigurasi ringkas B5 (approx)
+    // (expand, out_c, repeats, stride, kernel)
     let cfg: &[(i64, i64, i64, i64, i64)] = &[
         (1, 24, 2, 1, 3),
         (6, 40, 4, 2, 3),
@@ -183,7 +197,6 @@ fn efficientnet_b5(vs: &nn::Path, num_classes: i64) -> impl nn::ModuleT + use<> 
         let c = *c;
         for i in 0..*repeats {
             let s = if i == 0 { *stride } else { 1 };
-            // Bind path agar bukan temporary; modul tidak akan menangkapnya (thanks to use<>)
             let sub = vs.sub(&format!("mb_{}_{}", c, i));
             let mb = mbconv_block(&sub, in_c, c, *expand, *kernel, s);
             seq = seq.add(mb);
@@ -243,8 +256,10 @@ fn evaluate(
 
 fn main() -> Result<()> {
     let start_time = Instant::now();
+    tch::set_num_threads(num_cpus::get() as i32);
+    tch::set_num_interop_threads(1);
     let device = Device::Cpu; // mac ARM: CPU (no CUDA)
-    println!("🔧 Using device: {:?}", device);
+    println!(" Using device: {:?}", device);
 
     // Load datasets
     let (train_images, train_labels, classes) =
@@ -272,69 +287,87 @@ fn main() -> Result<()> {
     // VarStore
     let mut vs = nn::VarStore::new(device);
 
-    // ---- TRAINING SCOPE (agar borrow root/net/opt drop sebelum vs.load) ----
+    // ---- TRAINING SCOPE ----
     {
-        let root = vs.root();                         // immutable borrow hanya di scope ini
+        let root = vs.root();
         let net = efficientnet_b5(&root, num_classes);
         let mut opt = nn::Adam::default().build(&vs, LEARNING_RATE)?;
 
-        println!("Starting training...\n");
+        println!(" Starting training...\n");
+
+        // Progress bar untuk epoch
+        let epoch_pb = ProgressBar::new(EPOCHS as u64);
+        epoch_pb.set_style(
+            ProgressStyle::with_template("{spinner:.green} epoch {pos}/{len} {bar:40.cyan/blue} {msg}")
+                .unwrap()
+                .progress_chars("##-")
+        );
+
         let mut best_valid_acc = 0.0;
 
         for epoch in 1..=EPOCHS {
-            let epoch_start = Instant::now();
-
             // Shuffle training tensors
             let (train_xs_shuffled, train_ys_shuffled) = shuffle_dataset(&train_xs, &train_ys);
-
-            let mut train_loss = 0.0;
-            let mut train_correct = 0;
             let train_batches = batches(&train_xs_shuffled, &train_ys_shuffled, BATCH_SIZE);
 
-            for (i, (bxs, bys)) in train_batches.iter().enumerate() {
+            // Progress bar untuk batch (pakai prefix = nomor epoch)
+            let batch_pb = ProgressBar::new(train_batches.len() as u64);
+            batch_pb.set_style(
+                ProgressStyle::with_template("  [ep {prefix}] {elapsed_precise} {bar:40.green} {pos}/{len} • {msg}")
+                    .unwrap()
+                    .progress_chars("=>-")
+            );
+            batch_pb.set_prefix(epoch.to_string());
+
+            let mut train_loss_sum = 0.0;
+            let mut train_correct = 0i64;
+            let mut seen = 0i64;
+
+            for (bxs, bys) in train_batches.iter() {
                 let logits = net.forward_t(bxs, true);
                 let loss = logits.cross_entropy_for_logits(bys);
                 opt.backward_step(&loss);
 
-                train_loss += loss.double_value(&[]);
+                train_loss_sum += loss.double_value(&[]);
                 let preds = logits.argmax(-1, false);
-                train_correct += preds.eq_tensor(bys).sum(Kind::Int64).int64_value(&[]);
+                let batch_correct = preds.eq_tensor(bys).sum(Kind::Int64).int64_value(&[]);
+                train_correct += batch_correct;
+                seen += bys.size()[0];
 
-                if (i + 1) % 10 == 0 {
-                    print!("\r  Batch {}/{}", i + 1, train_batches.len());
-                }
+                let running_acc = (train_correct as f64) / (seen as f64) * 100.0;
+                let running_loss = train_loss_sum / (batch_pb.position() as f64 + 1.0);
+                batch_pb.set_message(format!("loss {running_loss:.4} • acc {running_acc:.2}%"));
+                batch_pb.inc(1);
             }
+            batch_pb.finish_and_clear();
 
             let train_acc = train_correct as f64 / train_xs.size()[0] as f64;
-            let train_loss = train_loss / train_batches.len() as f64;
+            let train_loss = train_loss_sum / (seen as f64 / BATCH_SIZE as f64);
 
             // Validation
             let (valid_loss, valid_acc) = evaluate(&net, &valid_xs, &valid_ys, device);
-
-            println!(
-                "\r✓ Epoch {:2}/{} | Train Loss: {:.4} Acc: {:.2}% | Valid Loss: {:.4} Acc: {:.2}% | Time: {:.2}s",
-                epoch, EPOCHS, train_loss, train_acc * 100.0,
-                valid_loss, valid_acc * 100.0, epoch_start.elapsed().as_secs_f64()
-            );
+            epoch_pb.set_message(format!(
+                "train_loss {train_loss:.4} • train_acc {:.2}% • val_loss {valid_loss:.4} • val_acc {:.2}%",
+                train_acc * 100.0, valid_acc * 100.0
+            ));
+            epoch_pb.inc(1);
 
             // Save best
             if valid_acc > best_valid_acc {
                 best_valid_acc = valid_acc;
                 std::fs::create_dir_all("../EfficientNetLoad").ok();
                 vs.save("../EfficientNetLoad/best_model.safetensors")?;
-                println!("  Saved best model (valid acc: {:.2}%)", best_valid_acc * 100.0);
+                epoch_pb.println(format!("  Saved best model (val acc: {:.2}%)", best_valid_acc * 100.0));
             }
         }
-
+        epoch_pb.finish_with_message("training done");
         // net, root, opt drop di sini
     }
     // ---- END TRAINING SCOPE ----
 
-    // Test: sekarang aman mutably borrow vs untuk load
-    println!("\n Evaluating on test set...");
+    // Test
+    println!("\n🧪 Evaluating on test set...");
     vs.load("../EfficientNetLoad/best_model.safetensors")?;
-
-    // Bangun ulang model setelah load
     let root = vs.root();
     let net = efficientnet_b5(&root, num_classes);
 
