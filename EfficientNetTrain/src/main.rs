@@ -364,7 +364,7 @@ fn main() -> Result<()> {
 
     // Test (stream)
     println!("\n Evaluating on test set...");
-    vs.load("../EfficientNetTrain/best_model_rust.safetensors")?;
+    vs.load("../EfficientNetLoad/best_model.safetensors")?;
     let root = vs.root();
     let net = efficientnet_b5_scaled(&root, num_classes, WIDTH_MULT, DEPTH_MULT);
 
