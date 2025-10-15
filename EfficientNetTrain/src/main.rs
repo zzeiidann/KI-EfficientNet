@@ -1,23 +1,27 @@
 use std::time::Instant;
 use anyhow::Result;
 use rand::seq::SliceRandom;
-use std::fs;
+use std::{fs, collections::HashMap};
 use tch::{nn, nn::ModuleT, nn::OptimizerConfig, Device, Kind, Tensor};
 use image::{imageops, DynamicImage};
 use rayon::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
 
 const IMG_SIZE: u32 = 224;          // Untuk lebih cepat, bisa 160/128
-const EPOCHS: i64 = 10;
+const EPOCHS: i64 = 1;
 const BATCH_SIZE: usize = 8;        // Aman untuk RAM kecil; naikin kalau kuat
-const LEARNING_RATE: f64 = 0.001;
+const LEARNING_RATE: f64 = 0.0001;
 
 // ==== SCALING PARAM ====
 const WIDTH_MULT: f64 = 0.75;       // 0.5–1.0 (lebih kecil = lebih cepat)
 const DEPTH_MULT: f64 = 0.80;       // 0.5–1.0
 
+// ==== MODEL SAVE PATH ====
+const MODEL_DIR: &str = "../models";
+const MODEL_PATH: &str = "../models/best_efficientnet_b5.safetensors";
+
+// ====== UTIL ======
 fn round_channels(c: i64, wm: f64) -> i64 {
-    // rounding sederhana + minimum 8 channel
     let v = (c as f64 * wm).round() as i64;
     v.max(8)
 }
@@ -54,43 +58,63 @@ fn augment_image(img: DynamicImage, is_training: bool) -> DynamicImage {
     img.adjust_contrast(contrast).brighten((brightness * 255.0) as i32)
 }
 
-fn load_split_dataset(
+// ====== DATA LOADING (LABEL MAPPING KONSISTEN) ======
+fn list_classes(base: &str) -> Result<Vec<String>> {
+    let mut classes: Vec<String> = fs::read_dir(format!("{}/train", base))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .filter_map(|p| p.file_name().and_then(|s| s.to_str()).map(|s| s.to_string()))
+        .collect();
+    classes.sort(); // penting: urutkan agar konsisten
+    Ok(classes)
+}
+
+fn load_split_dataset_with_classes(
     base: &str,
     split: &str,
+    classes: &[String],
     is_training: bool
-) -> Result<(Vec<Tensor>, Vec<i64>, Vec<String>)> {
-    let mut classes = Vec::new();
+) -> Result<(Vec<Tensor>, Vec<i64>)> {
     let mut all_images = Vec::new();
     let mut all_labels = Vec::new();
 
     let split_path = format!("{}/{}", base, split);
     if !std::path::Path::new(&split_path).exists() {
         println!("⚠ Split '{}' not found at: {}", split, split_path);
-        return Ok((all_images, all_labels, classes));
+        return Ok((all_images, all_labels));
     }
 
+    let index_map: HashMap<&str, i64> = classes
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.as_str(), i as i64))
+        .collect();
+
     println!("\n Loading {} dataset...", split.to_uppercase());
-    let entries: Vec<_> = fs::read_dir(&split_path)?.filter_map(|e| e.ok()).collect();
+    let mut class_entries: Vec<_> = fs::read_dir(&split_path)?.filter_map(|e| e.ok()).collect();
+    class_entries.sort_by_key(|e| e.file_name());
 
-    for entry in entries.iter() {
+    for entry in class_entries {
         let class_dir = entry.path();
-        if !class_dir.is_dir() {
-            eprintln!("  ⚠ Skip non-directory in {}: {:?}", split, class_dir.file_name());
+        if !class_dir.is_dir() { continue; }
+
+        let class_name = match class_dir.file_name().and_then(|s| s.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let Some(&class_idx) = index_map.get(class_name) else {
+            eprintln!("  ⚠ Kelas '{}' tidak ada di daftar global. Lewati.", class_name);
             continue;
-        }
+        };
 
-        let class_name = class_dir.file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-        classes.push(class_name.clone());
-        let class_idx = classes.len() as i64 - 1;
-
-        let img_paths: Vec<_> = fs::read_dir(&class_dir)?
+        let mut img_paths: Vec<_> = fs::read_dir(&class_dir)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.is_file())
             .collect();
+        img_paths.sort();
 
         println!("  Class {}: {} ({} images)", class_idx, class_name, img_paths.len());
 
@@ -120,66 +144,98 @@ fn load_split_dataset(
         }
     }
 
-    println!("✓ Loaded {} images from {} classes\n", all_images.len(), classes.len());
-    Ok((all_images, all_labels, classes))
+    println!("✓ Loaded {} images\n", all_images.len());
+    Ok((all_images, all_labels))
 }
 
 // ===== MODEL =====
+// Blok MBConv sebagai struct (hindari lifetime/borrow ke Path)
+#[derive(Debug)]
+struct MBConv {
+    conv_expand: Option<nn::Conv2D>,
+    bn_expand:   Option<nn::BatchNorm>,
+    conv_dw:     nn::Conv2D,
+    bn_dw:       nn::BatchNorm,
+    se_reduce:   nn::Linear,
+    se_expand:   nn::Linear,
+    conv_project: nn::Conv2D,
+    bn_project:  nn::BatchNorm,
+    stride:      i64,
+    out_c:       i64,
+}
 
-fn mbconv_block(
-    vs: &nn::Path,
-    in_c: i64,
-    out_c: i64,
-    expand_ratio: i64,
-    kernel: i64,
-    stride: i64
-) -> impl nn::ModuleT + use<> {
-    let exp_c = in_c * expand_ratio;
+impl MBConv {
+    fn new(
+        vs: &nn::Path,
+        in_c: i64,
+        out_c: i64,
+        expand_ratio: i64,
+        kernel: i64,
+        stride: i64
+    ) -> Self {
+        let exp_c = in_c * expand_ratio;
 
-    let conv_expand = if expand_ratio != 1 {
-        Some(nn::conv2d(vs, in_c, exp_c, 1, Default::default()))
-    } else { None };
-    let bn_expand = if expand_ratio != 1 {
-        Some(nn::batch_norm2d(vs, exp_c, Default::default()))
-    } else { None };
+        let conv_expand = if expand_ratio != 1 {
+            Some(nn::conv2d(vs, in_c, exp_c, 1, Default::default()))
+        } else { None };
+        let bn_expand = if expand_ratio != 1 {
+            Some(nn::batch_norm2d(vs, exp_c, Default::default()))
+        } else { None };
 
-    let conv_dw = nn::conv2d(
-        vs, exp_c, exp_c, kernel,
-        nn::ConvConfig { padding: (kernel / 2) as i64, stride, groups: exp_c, ..Default::default() }
-    );
-    let bn_dw = nn::batch_norm2d(vs, exp_c, Default::default());
+        let conv_dw = nn::conv2d(
+            vs, exp_c, exp_c, kernel,
+            nn::ConvConfig { padding: (kernel / 2) as i64, stride, groups: exp_c, ..Default::default() }
+        );
+        let bn_dw = nn::batch_norm2d(vs, exp_c, Default::default());
 
-    let se_reduce = nn::linear(vs, exp_c, (exp_c / 4).max(1), Default::default());
-    let se_expand = nn::linear(vs, (exp_c / 4).max(1), exp_c, Default::default());
+        let se_reduce = nn::linear(vs, exp_c, (exp_c / 4).max(1), Default::default());
+        let se_expand = nn::linear(vs, (exp_c / 4).max(1), exp_c, Default::default());
 
-    let conv_project = nn::conv2d(vs, exp_c, out_c, 1, Default::default());
-    let bn_project = nn::batch_norm2d(vs, out_c, Default::default());
+        let conv_project = nn::conv2d(vs, exp_c, out_c, 1, Default::default());
+        let bn_project = nn::batch_norm2d(vs, out_c, Default::default());
 
-    nn::func_t(move |xs, train| {
-        let mut x = xs.shallow_clone();
-        if expand_ratio != 1 {
-            x = conv_expand.as_ref().unwrap().forward_t(&x, train);
-            x = bn_expand.as_ref().unwrap().forward_t(&x, train).silu();
+        Self {
+            conv_expand,
+            bn_expand,
+            conv_dw,
+            bn_dw,
+            se_reduce,
+            se_expand,
+            conv_project,
+            bn_project,
+            stride,
+            out_c,
         }
-        x = conv_dw.forward_t(&x, train);
-        x = bn_dw.forward_t(&x, train).silu();
+    }
+}
 
+impl nn::ModuleT for MBConv {
+    fn forward_t(&self, xs: &Tensor, train: bool) -> Tensor {
+        let mut x = xs.shallow_clone();
+        if let (Some(conv_e), Some(bn_e)) = (&self.conv_expand, &self.bn_expand) {
+            x = conv_e.forward_t(&x, train);
+            x = bn_e.forward_t(&x, train).silu();
+        }
+        x = self.conv_dw.forward_t(&x, train);
+        x = self.bn_dw.forward_t(&x, train).silu();
+
+        let exp_c = x.size()[1];
         let se = x.adaptive_avg_pool2d(&[1, 1]).view([-1, exp_c]);
-        let se = se_reduce.forward_t(&se, train).silu();
-        let se = se_expand.forward_t(&se, train).sigmoid().view([-1, exp_c, 1, 1]);
+        let se = self.se_reduce.forward_t(&se, train).silu();
+        let se = self.se_expand.forward_t(&se, train).sigmoid().view([-1, exp_c, 1, 1]);
         x = &x * &se;
 
-        x = conv_project.forward_t(&x, train);
-        x = bn_project.forward_t(&x, train);
+        x = self.conv_project.forward_t(&x, train);
+        x = self.bn_project.forward_t(&x, train);
 
-        if stride == 1 && xs.size()[1] == out_c {
+        if self.stride == 1 && xs.size()[1] == self.out_c {
             return (xs + x).to_kind(Kind::Float);
         }
         x
-    })
+    }
 }
 
-fn efficientnet_b5_scaled(vs: &nn::Path, num_classes: i64, wm: f64, dm: f64) -> impl nn::ModuleT + use<> {
+fn efficientnet_b5_scaled(vs: &nn::Path, num_classes: i64, wm: f64, dm: f64) -> nn::SequentialT {
     // Konfigurasi B5 ringkas (expand, out_c, repeats, stride, kernel)
     let base: &[(i64, i64, i64, i64, i64)] = &[
         (1, 24, 2, 1, 3),
@@ -206,7 +262,7 @@ fn efficientnet_b5_scaled(vs: &nn::Path, num_classes: i64, wm: f64, dm: f64) -> 
         for i in 0..rep {
             let s = if i == 0 { stride } else { 1 };
             let sub = vs.sub(&format!("mb_{}_{}", c, i));
-            let mb = mbconv_block(&sub, in_c, c, expand, kernel, s);
+            let mb = MBConv::new(&sub, in_c, c, expand, kernel, s);
             seq = seq.add(mb);
             in_c = c;
         }
@@ -218,14 +274,13 @@ fn efficientnet_b5_scaled(vs: &nn::Path, num_classes: i64, wm: f64, dm: f64) -> 
         .add(nn::batch_norm2d(vs, last, Default::default()))
         .add_fn(|x| x.silu())
         .add_fn(|x| x.adaptive_avg_pool2d(&[1, 1]))
-        .add_fn_t(|x, train| x.dropout(0.3, train)) // dropout sedikit diturunkan
+        .add_fn_t(|x, train| x.dropout(0.3, train))
         .add_fn(move |x| x.view([-1, last]))
         .add(nn::linear(vs, last, num_classes, Default::default()));
     seq
 }
 
 // ===== DATALOADER-STYLE (streaming) =====
-
 fn batch_from_vec(
     images: &[Tensor],
     labels: &[i64],
@@ -257,64 +312,69 @@ fn eval_stream(
         tot_seen += bys.size()[0];
     }
     let acc = if tot_seen > 0 { tot_correct as f64 / tot_seen as f64 } else { 0.0 };
-    let loss = if tot_seen > 0 { tot_loss / ((tot_seen as f64 / batch_size as f64).max(1.0)) } else { 0.0 };
+    let denom = (tot_seen as f64 / batch_size as f64).max(1.0);
+    let loss = if tot_seen > 0 { tot_loss / denom } else { 0.0 };
     (loss, acc)
 }
 
 // ===== MAIN =====
-
 fn main() -> Result<()> {
     let start_time = Instant::now();
     tch::set_num_threads(num_cpus::get() as i32);
     tch::set_num_interop_threads(1);
+    tch::manual_seed(42);
     let device = Device::Cpu;
-    println!("🔧 Using device: {:?} | threads: {}", device, num_cpus::get());
+    println!("Using device: {:?} | threads: {}", device, num_cpus::get());
 
-    // Load datasets
-    let (train_images, train_labels, classes) = load_split_dataset("../data", "train", true)?;
-    let (valid_images, valid_labels, _)      = load_split_dataset("../data", "valid", false)?;
-    let (test_images,  test_labels,  _)      = load_split_dataset("../data", "test",  false)?;
-
+    // Daftar kelas global dari TRAIN (urut lexicographically)
+    let classes = list_classes("../data")?;
     let num_classes = classes.len() as i64;
+
+    // Load semua split dengan mapping kelas yang sama
+    let (train_images, train_labels) = load_split_dataset_with_classes("../data", "train", &classes, true)?;
+    let (valid_images, valid_labels) = load_split_dataset_with_classes("../data", "valid", &classes, false)?;
+    let (test_images,  test_labels ) = load_split_dataset_with_classes("../data", "test",  &classes, false)?;
+
     println!(" Dataset summary:");
     println!("  Train: {} images", train_images.len());
     println!("  Valid: {} images", valid_images.len());
     println!("  Test:  {} images", test_images.len());
-    println!("  Classes: {} {:?}\n", num_classes, classes);
+    println!("  Classes ({}): {:?}\n", num_classes, classes);
 
-    // VarStore
-    let mut vs = nn::VarStore::new(device);
+    fs::create_dir_all(MODEL_DIR)?;
+    println!("Model will be saved to: {}\n", MODEL_PATH);
 
-    // ---- TRAINING SCOPE ----
+    // ===== TRAINING =====
     {
-        let root = vs.root();
-        let net = efficientnet_b5_scaled(&root, num_classes, WIDTH_MULT, DEPTH_MULT);
+        let mut vs = nn::VarStore::new(device);
+        let net = {
+            let root = vs.root();
+            efficientnet_b5_scaled(&root, num_classes, WIDTH_MULT, DEPTH_MULT)
+        };
         let mut opt = nn::Adam::default().build(&vs, LEARNING_RATE)?;
 
         println!("Starting training...\n");
 
-        // Progress bar epoch
         let epoch_pb = ProgressBar::new(EPOCHS as u64);
-        epoch_pb.set_style(
-            ProgressStyle::with_template("{spinner:.green} epoch {pos}/{len} {bar:38.cyan/blue} {msg}")
-                .unwrap()
-                .progress_chars("##-")
-        );
+        epoch_pb
+            .set_style(
+                ProgressStyle::with_template("{spinner:.green} epoch {pos}/{len} {bar:38.cyan/blue} {msg}")
+                    .unwrap()
+                    .progress_chars("##-"),
+            );
 
         let mut best_valid_acc = 0.0;
 
         for epoch in 1..=EPOCHS {
-            // siapkan index dan shuffle
             let mut indices: Vec<usize> = (0..train_images.len()).collect();
             indices.shuffle(&mut rand::thread_rng());
 
-            // progress bar batch berbasis sample
             let total_samples = indices.len() as u64;
             let batch_pb = ProgressBar::new(total_samples);
             batch_pb.set_style(
                 ProgressStyle::with_template("  [ep {prefix}] {elapsed_precise} {bar:38.green} {pos}/{len} • {per_sec} • eta {eta_precise} • {msg}")
                     .unwrap()
-                    .progress_chars("#>-")
+                    .progress_chars("#>-"),
             );
             batch_pb.set_prefix(epoch.to_string());
 
@@ -344,29 +404,28 @@ fn main() -> Result<()> {
             }
             batch_pb.finish_and_clear();
 
-            // Validation (stream)
             let (valid_loss, valid_acc) = eval_stream(&net, &valid_images, &valid_labels, device, BATCH_SIZE);
             epoch_pb.set_message(format!("val_loss {valid_loss:.4} • val_acc {:.2}%", valid_acc * 100.0));
             epoch_pb.inc(1);
 
-            // save best
             if valid_acc > best_valid_acc {
                 best_valid_acc = valid_acc;
-                std::fs::create_dir_all("../EfficientNetLoad").ok();
-                vs.save("../EfficientNetLoad/best_model.safetensors")?;
+                vs.save(MODEL_PATH)?;
                 epoch_pb.println(format!("Saved best model (val acc: {:.2}%)", best_valid_acc * 100.0));
             }
         }
         epoch_pb.finish_with_message("training done");
-        // net, root, opt drop di sini
     }
-    // ---- END TRAINING SCOPE ----
 
-    // Test (stream)
+    // ===== TEST / EVALUATION =====
     println!("\n Evaluating on test set...");
-    vs.load("../EfficientNetLoad/best_model.safetensors")?;
-    let root = vs.root();
-    let net = efficientnet_b5_scaled(&root, num_classes, WIDTH_MULT, DEPTH_MULT);
+    let mut vs = nn::VarStore::new(device);
+    let net = {
+        let root = vs.root();
+        efficientnet_b5_scaled(&root, num_classes, WIDTH_MULT, DEPTH_MULT)
+    };
+    // Tidak ada borrow aktif terhadap `vs` saat load
+    vs.load(MODEL_PATH)?;
 
     let (test_loss, test_acc) = eval_stream(&net, &test_images, &test_labels, device, BATCH_SIZE);
     println!("✓ Test Loss: {:.4} | Test Accuracy: {:.2}%", test_loss, test_acc * 100.0);
