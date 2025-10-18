@@ -8,13 +8,13 @@ use rayon::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
 
 const IMG_SIZE: u32 = 224;          // Untuk lebih cepat, bisa 160/128
-const EPOCHS: i64 = 1;
+const EPOCHS: i64 = 50;
 const BATCH_SIZE: usize = 8;        // Aman untuk RAM kecil; naikin kalau kuat
 const LEARNING_RATE: f64 = 0.0001;
 
 // ==== SCALING PARAM ====
-const WIDTH_MULT: f64 = 0.75;       // 0.5–1.0 (lebih kecil = lebih cepat)
-const DEPTH_MULT: f64 = 0.80;       // 0.5–1.0
+const WIDTH_MULT: f64 = 1.0;
+const DEPTH_MULT: f64 = 1.0;
 
 // ==== MODEL SAVE PATH ====
 const MODEL_DIR: &str = "../models";
@@ -22,9 +22,17 @@ const MODEL_PATH: &str = "../models/best_efficientnet_b5.safetensors";
 
 // ====== UTIL ======
 fn round_channels(c: i64, wm: f64) -> i64 {
-    let v = (c as f64 * wm).round() as i64;
-    v.max(8)
+    let mut scaled = (c as f64 * wm).round() as i64;
+    let divisor = 8;
+    scaled = (scaled + divisor / 2) / divisor * divisor;
+    scaled = scaled.max(divisor);
+    if scaled < (0.9 * c as f64 * wm) as i64 {
+        scaled + divisor
+    } else {
+        scaled
+    }
 }
+
 fn round_repeats(r: i64, dm: f64) -> i64 {
     let v = (r as f64 * dm).round() as i64;
     v.max(1)
@@ -162,6 +170,7 @@ struct MBConv {
     bn_project:  nn::BatchNorm,
     stride:      i64,
     out_c:       i64,
+    drop_connect: f64,
 }
 
 impl MBConv {
@@ -171,7 +180,8 @@ impl MBConv {
         out_c: i64,
         expand_ratio: i64,
         kernel: i64,
-        stride: i64
+        stride: i64,
+        drop_connect: f64,
     ) -> Self {
         let exp_c = in_c * expand_ratio;
 
@@ -205,6 +215,7 @@ impl MBConv {
             bn_project,
             stride,
             out_c,
+            drop_connect,
         }
     }
 }
@@ -229,7 +240,13 @@ impl nn::ModuleT for MBConv {
         x = self.bn_project.forward_t(&x, train);
 
         if self.stride == 1 && xs.size()[1] == self.out_c {
-            return (xs + x).to_kind(Kind::Float);
+            let mut out = xs + x;
+            if train && self.drop_connect > 0.0 {
+                let keep = 1.0 - self.drop_connect;
+                let mask = Tensor::rand_like(&out).ge(keep).to_kind(Kind::Float);
+                out = (&out / keep) * (1.0 - mask);
+            }
+            return out;
         }
         x
     }
@@ -262,7 +279,7 @@ fn efficientnet_b5_scaled(vs: &nn::Path, num_classes: i64, wm: f64, dm: f64) -> 
         for i in 0..rep {
             let s = if i == 0 { stride } else { 1 };
             let sub = vs.sub(&format!("mb_{}_{}", c, i));
-            let mb = MBConv::new(&sub, in_c, c, expand, kernel, s);
+            let mb = MBConv::new(&sub, in_c, c, expand, kernel, s, 0.2);
             seq = seq.add(mb);
             in_c = c;
         }
@@ -323,9 +340,14 @@ fn main() -> Result<()> {
     tch::set_num_threads(num_cpus::get() as i32);
     tch::set_num_interop_threads(1);
     tch::manual_seed(42);
-    let device = Device::Cpu;
-    println!("Using device: {:?} | threads: {}", device, num_cpus::get());
-
+    
+    let device = if tch::Cuda::is_available() {
+        Device::Cuda(0)
+    } else {
+        Device::Cpu
+    };
+    println!("Using device: {:?}\n", device);
+    
     // Daftar kelas global dari TRAIN (urut lexicographically)
     let classes = list_classes("../data")?;
     let num_classes = classes.len() as i64;
@@ -346,7 +368,7 @@ fn main() -> Result<()> {
 
     // ===== TRAINING =====
     {
-        let mut vs = nn::VarStore::new(device);
+        let vs = nn::VarStore::new(device);
         let net = {
             let root = vs.root();
             efficientnet_b5_scaled(&root, num_classes, WIDTH_MULT, DEPTH_MULT)
@@ -362,8 +384,6 @@ fn main() -> Result<()> {
                     .unwrap()
                     .progress_chars("##-"),
             );
-
-        let mut best_valid_acc = 0.0;
 
         for epoch in 1..=EPOCHS {
             let mut indices: Vec<usize> = (0..train_images.len()).collect();
@@ -405,16 +425,20 @@ fn main() -> Result<()> {
             batch_pb.finish_and_clear();
 
             let (valid_loss, valid_acc) = eval_stream(&net, &valid_images, &valid_labels, device, BATCH_SIZE);
-            epoch_pb.set_message(format!("val_loss {valid_loss:.4} • val_acc {:.2}%", valid_acc * 100.0));
+            let train_loss = train_loss_sum / (seen as f64 / BATCH_SIZE as f64);
+            let train_acc = (train_correct as f64) / (seen as f64);
+            epoch_pb.set_message(format!("train_loss {train_loss:.4} • train_acc {:.2}% • val_loss {valid_loss:.4} • val_acc {:.2}%", train_acc * 100.0, valid_acc * 100.0));
             epoch_pb.inc(1);
 
-            if valid_acc > best_valid_acc {
-                best_valid_acc = valid_acc;
-                vs.save(MODEL_PATH)?;
-                epoch_pb.println(format!("Saved best model (val acc: {:.2}%)", best_valid_acc * 100.0));
-            }
         }
-        epoch_pb.finish_with_message("training done");
+        epoch_pb.finish_with_message("Training Done");
+
+        vs.save(MODEL_PATH)?;
+        epoch_pb.println(format!("Saved model"));
+
+        drop(opt);
+        drop(net);
+        drop(vs);
     }
 
     // ===== TEST / EVALUATION =====
